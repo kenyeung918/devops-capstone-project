@@ -1,151 +1,329 @@
 """
-Account Service
+Account API Service Test Suite
 
-This microservice handles the lifecycle of Accounts
+Test cases can be run with the following:
+  nosetests -v --with-spec --spec-color
+  coverage report -m
 """
-# pylint: disable=unused-import
-from flask import jsonify, request, make_response, abort, url_for   # noqa; F401
-from service.models import Account
+import os
+import logging
+from unittest import TestCase
+from tests.factories import AccountFactory
 from service.common import status  # HTTP Status Codes
-from . import app  # Import Flask application
+from service.models import db, Account, init_db
+from service.routes import app
+from service import talisman
 
+DATABASE_URI = os.getenv(
+    "DATABASE_URI", "postgresql://postgres:postgres@localhost:5432/postgres"
+)
 
-############################################################
-# Health Endpoint
-############################################################
-@app.route("/health")
-def health():
-    """Health Status"""
-    return jsonify(dict(status="OK")), status.HTTP_200_OK
+BASE_URL = "/accounts"
 
-
-######################################################################
-# GET INDEX
-######################################################################
-@app.route("/")
-def index():
-    """Root URL response"""
-    return (
-        jsonify(
-            name="Account REST API Service",
-            version="1.0",
-            paths=url_for("list_accounts", _external=True),
-        ),
-        status.HTTP_200_OK,
-    )
+# Define HTTPS environ for testing
+HTTPS_ENVIRON = {'wsgi.url_scheme': 'https'}
 
 
 ######################################################################
-# CREATE A NEW ACCOUNT
+#  T E S T   C A S E S
 ######################################################################
-@app.route("/accounts", methods=["POST"])
-def create_accounts():
-    """
-    Creates an Account
-    This endpoint will create an Account based the data in the body that is posted
-    """
-    app.logger.info("Request to create an Account")
-    check_content_type("application/json")
-    account = Account()
-    account.deserialize(request.get_json())
-    account.create()
-    message = account.serialize()
-    # Create location URL for the newly created account
-    location_url = url_for("get_accounts", account_id=account.id, _external=True)
-    return make_response(
-        jsonify(message), status.HTTP_201_CREATED, {"Location": location_url}
-    )
+class TestAccountService(TestCase):
+    """Account Service Tests"""
 
+    @classmethod
+    def setUpClass(cls):
+        """Run once before all tests"""
+        app.config["TESTING"] = True
+        app.config["DEBUG"] = False
+        app.config["SQLALCHEMY_DATABASE_URI"] = DATABASE_URI
+        app.logger.setLevel(logging.CRITICAL)
+        init_db(app)
+        talisman.force_https = False
 
-######################################################################
-# LIST ALL ACCOUNTS
-######################################################################
-@app.route("/accounts", methods=["GET"])
-def list_accounts():
-    """
-    Lists all Accounts
-    This endpoint will return a list of all accounts
-    """
-    app.logger.info("Request to list all Accounts")
-    accounts = Account.all()
-    account_list = [account.serialize() for account in accounts]
-    return jsonify(account_list), status.HTTP_200_OK
+    @classmethod
+    def tearDownClass(cls):
+        """Runs once before test suite"""
 
+    def setUp(self):
+        """Runs before each test"""
+        db.session.query(Account).delete()  # clean up the last tests
+        db.session.commit()
 
-######################################################################
-# READ AN ACCOUNT
-######################################################################
-@app.route("/accounts/<int:account_id>", methods=["GET"])
-def get_accounts(account_id):
-    """
-    Reads an Account
-    This endpoint will read an Account based the account_id that is requested
-    """
-    app.logger.info("Request to read an Account with id: %s", account_id)
+        self.client = app.test_client()
 
-    account = Account.find(account_id)
-    if not account:
-        abort(status.HTTP_404_NOT_FOUND, f"Account with id [{account_id}] could not be found.")
+    def tearDown(self):
+        """Runs once after each test case"""
+        db.session.remove()
 
-    return account.serialize(), status.HTTP_200_OK
+    ######################################################################
+    #  H E L P E R   M E T H O D S
+    ######################################################################
 
+    def _create_accounts(self, count):
+        """Factory method to create accounts in bulk"""
+        accounts = []
+        for _ in range(count):
+            account = AccountFactory()
+            response = self.client.post(BASE_URL, json=account.serialize())
+            self.assertEqual(
+                response.status_code,
+                status.HTTP_201_CREATED,
+                "Could not create test Account",
+            )
+            new_account = response.get_json()
+            account.id = new_account["id"]
+            accounts.append(account)
+        return accounts
 
-######################################################################
-# UPDATE AN EXISTING ACCOUNT
-######################################################################
-@app.route("/accounts/<int:account_id>", methods=["PUT"])
-def update_accounts(account_id):
-    """
-    Updates an Account
-    This endpoint will update an Account based on the data in the body
-    """
-    app.logger.info("Request to update an Account with id: %s", account_id)
+    ######################################################################
+    #  A C C O U N T   T E S T   C A S E S
+    ######################################################################
+
+    def test_index(self):
+        """It should get 200_OK from the Home Page"""
+        response = self.client.get("/")
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+
+    def test_health(self):
+        """It should be healthy"""
+        resp = self.client.get("/health")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.get_json()
+        self.assertEqual(data["status"], "OK")
+
+    def test_create_account(self):
+        """It should Create a new Account"""
+        account = AccountFactory()
+        response = self.client.post(
+            BASE_URL,
+            json=account.serialize(),
+            content_type="application/json"
+        )
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED)
+
+        # Make sure location header is set
+        location = response.headers.get("Location", None)
+        self.assertIsNotNone(location)
+
+        # Check the data is correct
+        new_account = response.get_json()
+        self.assertEqual(new_account["name"], account.name)
+        self.assertEqual(new_account["email"], account.email)
+        self.assertEqual(new_account["address"], account.address)
+        self.assertEqual(new_account["phone_number"], account.phone_number)
+        self.assertEqual(new_account["date_joined"], str(account.date_joined))
+
+    def test_bad_request(self):
+        """It should not Create an Account when sending the wrong data"""
+        response = self.client.post(BASE_URL, json={"name": "not enough data"})
+        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_unsupported_media_type(self):
+        """It should not Create an Account when sending the wrong media type"""
+        account = AccountFactory()
+        response = self.client.post(
+            BASE_URL,
+            json=account.serialize(),
+            content_type="test/html"
+        )
+        self.assertEqual(response.status_code, status.HTTP_415_UNSUPPORTED_MEDIA_TYPE)
+
+        def test_get_account(self):
+        """It should Read a single Account"""
+        account = self._create_accounts(1)[0]
+        resp = self.client.get(
+            f"{BASE_URL}/{account.id}", content_type="application/json"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.get_json()
+        self.assertEqual(data["name"], account.name)
+
+    def test_get_account_not_found(self):
+        """It should not Read an Account that is not found"""
+        resp = self.client.get(f"{BASE_URL}/0")
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_get_account_list(self):
+        """It should Get a list of Accounts"""
+        self._create_accounts(5)
+        resp = self.client.get(BASE_URL)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        data = resp.get_json()
+        self.assertEqual(len(data), 5)
+
+    def test_update_account(self):
+        """It should Update an existing Account"""
+        # create an Account to update
+        test_account = AccountFactory()
+        resp = self.client.post(BASE_URL, json=test_account.serialize())
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED)
+
+        # update the account
+        new_account = resp.get_json()
+        new_account["name"] = "Something Known"
+        resp = self.client.put(f"{BASE_URL}/{new_account['id']}", json=new_account)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK)
+        updated_account = resp.get_json()
+        self.assertEqual(updated_account["name"], "Something Known")
+
+    def test_delete_account(self):
+        """It should Delete an Account"""
+        account = self._create_accounts(1)[0]
+        resp = self.client.delete(f"{BASE_URL}/{account.id}")
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)        
     
-    # Check content type
-    check_content_type("application/json")
-    
-    # Find the account to update
-    account = Account.find(account_id)
-    if not account:
-        abort(status.HTTP_404_NOT_FOUND, f"Account with id [{account_id}] could not be found.")
-    
-    # Update the account with the new data
-    account.deserialize(request.get_json())
-    account.update()
-    
-    return account.serialize(), status.HTTP_200_OK
+    def test_method_not_allowed(self):
+        """It should not allow an illegal method call"""
+        resp = self.client.delete(BASE_URL)
+        self.assertEqual(resp.status_code, status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    ######################################################################
+    #  S E C U R I T Y   H E A D E R S   T E S T S
+    ######################################################################
+
+    def test_security_headers(self):
+        """It should return security headers"""
+        response = self.client.get('/', environ_overrides=HTTPS_ENVIRON)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        # Define expected security headers
+        headers = {
+            'X-Frame-Options': 'DENY',  # Your app uses DENY
+            'X-Content-Type-Options': 'nosniff',
+            'X-XSS-Protection': '1; mode=block',
+            'Strict-Transport-Security': 'max-age=31536000; includeSubDomains',
+            'Referrer-Policy': 'strict-origin-when-cross-origin'
+        }
+        
+        for key, value in headers.items():
+            self.assertEqual(response.headers.get(key), value)
+
+    def test_cors_headers(self):
+        """It should return CORS headers for allowed origins"""
+        # Test with a valid origin
+        response = self.client.get(
+            '/', 
+            headers={'Origin': 'https://trusted-domain.com'},
+            environ_overrides=HTTPS_ENVIRON
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        # Check CORS headers
+        self.assertEqual(response.headers.get('Access-Control-Allow-Origin'), 'https://trusted-domain.com')
+        self.assertIsNotNone(response.headers.get('Access-Control-Allow-Methods'))
+        self.assertIsNotNone(response.headers.get('Access-Control-Allow-Headers'))
+
+    def test_cors_preflight(self):
+        """It should handle CORS preflight OPTIONS request"""
+        response = self.client.options(
+            '/',
+            headers={
+                'Origin': 'https://trusted-domain.com',
+                'Access-Control-Request-Method': 'POST',
+                'Access-Control-Request-Headers': 'Content-Type'
+            },
+            environ_overrides=HTTPS_ENVIRON
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        # Check CORS preflight headers
+        self.assertEqual(response.headers.get('Access-Control-Allow-Origin'), 'https://trusted-domain.com')
+        self.assertIn('POST', response.headers.get('Access-Control-Allow-Methods', ''))
+        self.assertIn('Content-Type', response.headers.get('Access-Control-Allow-Headers', ''))
+
+    def test_cors_disallowed_origin(self):
+        """It should not allow CORS from disallowed origins"""
+        response = self.client.get(
+            '/',
+            headers={'Origin': 'https://malicious-site.com'},
+            environ_overrides=HTTPS_ENVIRON
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        # Check that CORS headers are not set for disallowed origin
+        self.assertIsNone(response.headers.get('Access-Control-Allow-Origin'))
+
+    def test_content_security_policy(self):
+        """It should have Content Security Policy headers"""
+        response = self.client.get('/', environ_overrides=HTTPS_ENVIRON)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        # Check CSP header
+        csp = response.headers.get('Content-Security-Policy')
+        self.assertIsNotNone(csp)
+        self.assertIn("default-src 'self'", csp)
+
+    def test_no_server_info_leak(self):
+        """It should not leak server information"""
+        response = self.client.get('/')
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        # Check that Server header doesn't expose technology stack
+        server_header = response.headers.get('Server')
+        if server_header:  # If server header exists
+            self.assertNotIn('gunicorn', server_header.lower())
+            self.assertNotIn('python', server_header.lower())
+
+    def test_cors_with_credentials(self):
+        """It should handle CORS requests with credentials"""
+        response = self.client.get(
+            '/',
+            headers={
+                'Origin': 'https://trusted-domain.com',
+                'Cookie': 'session=12345'
+            },
+            environ_overrides=HTTPS_ENVIRON
+        )
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        
+        # If credentials are allowed, check for the header
+        if response.headers.get('Access-Control-Allow-Credentials'):
+            self.assertEqual(response.headers.get('Access-Control-Allow-Credentials'), 'true')
+
+    def test_method_not_allowed_cors(self):
+        """It should handle OPTIONS for methods not allowed"""
+        response = self.client.options(
+            '/',
+            headers={
+                'Origin': 'https://trusted-domain.com',
+                'Access-Control-Request-Method': 'DELETE'
+            },
+            environ_overrides=HTTPS_ENVIRON
+        )
+        
+        # Either 200 OK or 405 Method Not Allowed is acceptable
+        self.assertIn(response.status_code, [200, 405])
+
+    def test_security_headers_on_error(self):
+        """It should return security headers even on error responses"""
+        # Test a 404 page
+        response = self.client.get('/nonexistent-route', environ_overrides=HTTPS_ENVIRON)
+        self.assertEqual(response.status_code, status.HTTP_404_NOT_FOUND)
+        
+        # Security headers should still be present
+        self.assertEqual(response.headers.get('X-Content-Type-Options'), 'nosniff')
+        self.assertEqual(response.headers.get('X-Frame-Options'), 'DENY')
+
+    def test_cors_max_age(self):
+        """It should set CORS max age for preflight caching"""
+        response = self.client.options(
+            '/',
+            headers={
+                'Origin': 'https://trusted-domain.com',
+                'Access-Control-Request-Method': 'GET'
+            },
+            environ_overrides=HTTPS_ENVIRON
+        )
+        
+        # Check if max-age is set (optional but recommended)
+        max_age = response.headers.get('Access-Control-Max-Age')
+        if max_age:
+            self.assertTrue(int(max_age) > 0)
 
 
-######################################################################
-# DELETE AN ACCOUNT
-######################################################################
-@app.route("/accounts/<int:account_id>", methods=["DELETE"])
-def delete_accounts(account_id):
-    """
-    Deletes an Account
-    This endpoint will delete an Account based the account_id that is requested
-    """
-    app.logger.info("Request to delete an Account with id: %s", account_id)
-    
-    # Find the account to delete
-    account = Account.find(account_id)
-    if account:
-        account.delete()
-    
-    # Return 204 No Content regardless of whether the account existed or not
-    return "", status.HTTP_204_NO_CONTENT
-
-
-######################################################################
-#  U T I L I T Y   F U N C T I O N S
-######################################################################
-def check_content_type(media_type):
-    """Checks that the media type is correct"""
-    content_type = request.headers.get("Content-Type")
-    if content_type and content_type == media_type:
-        return
-    app.logger.error("Invalid Content-Type: %s", content_type)
-    abort(
-        status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-        f"Content-Type must be {media_type}",
-    )
+    def test_cors_security(self):
+        """It should return a CORS header"""
+        response = self.client.get('/', environ_overrides=HTTPS_ENVIRON)
+        self.assertEqual(response.status_code, status.HTTP_200_OK)
+        # Check for the CORS header
+        self.assertEqual(response.headers.get('Access-Control-Allow-Origin'), '*')
